@@ -55,6 +55,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int TIMEOUT_EXCEEDED;
     extern const int INCOMPATIBLE_COLUMNS;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -208,6 +209,7 @@ StorageFile::StorageFile(const std::string & relative_table_dir_path, CommonArgu
 StorageFile::StorageFile(CommonArguments args)
     : IStorage(args.table_id)
     , format_name(args.format_name)
+    , format_header(args.format_header)
     , format_settings(args.format_settings)
     , compression_method(args.compression_method)
     , base_path(args.getContext()->getPath())
@@ -277,6 +279,7 @@ public:
 
     StorageFileSource(
         std::shared_ptr<StorageFile> storage_,
+        std::optional<IInputFormatHeader> format_header_,
         const StorageMetadataPtr & metadata_snapshot_,
         ContextPtr context_,
         UInt64 max_block_size_,
@@ -284,6 +287,7 @@ public:
         ColumnsDescription columns_description_)
         : SourceWithProgress(getBlockForSource(storage_, metadata_snapshot_, columns_description_, files_info_))
         , storage(std::move(storage_))
+        , format_header(format_header_)
         , metadata_snapshot(metadata_snapshot_)
         , files_info(std::move(files_info_))
         , columns_description(std::move(columns_description_))
@@ -317,6 +321,17 @@ public:
             if (!shared_lock)
                 throw Exception("Lock timeout exceeded", ErrorCodes::TIMEOUT_EXCEEDED);
         }
+    }
+
+    StorageFileSource(
+        std::shared_ptr<StorageFile> storage_,
+        const StorageMetadataPtr & metadata_snapshot_,
+        ContextPtr context_,
+        UInt64 max_block_size_,
+        FilesInfoPtr files_info_,
+        ColumnsDescription columns_description_)
+        : StorageFileSource(storage_, {}, metadata_snapshot_, context_, max_block_size_, files_info_, columns_description_)
+    {
     }
 
     String getName() const override
@@ -370,8 +385,16 @@ public:
                     return metadata_snapshot->getSampleBlock();
                 };
 
-                auto format = FormatFactory::instance().getInput(
+                InputFormatPtr format;
+                if (format_header)
+                {
+                    format = FormatFactory::instance().getInput(
+                    storage->format_name, *read_buf, *format_header, context, max_block_size, storage->format_settings);
+                } else
+                {
+                    format = FormatFactory::instance().getInput(
                     storage->format_name, *read_buf, get_block_for_format(), context, max_block_size, storage->format_settings);
+                }
 
                 reader = std::make_shared<InputStreamFromInputFormat>(format);
 
@@ -420,6 +443,7 @@ public:
 
 private:
     std::shared_ptr<StorageFile> storage;
+    std::optional<IInputFormatHeader> format_header;
     StorageMetadataPtr metadata_snapshot;
     FilesInfoPtr files_info;
     String current_path;
@@ -668,6 +692,7 @@ void registerStorageFile(StorageFactory & factory)
 {
     StorageFactory::StorageFeatures storage_features{
         .supports_settings = true,
+        .supports_schema_inference = true,
         .source_access_type = AccessType::FILE
     };
 
@@ -682,9 +707,10 @@ void registerStorageFile(StorageFactory & factory)
                 {},
                 {},
                 {},
+                {},
                 factory_args.columns,
                 factory_args.constraints,
-                factory_args.comment,
+                factory_args.comment
             };
 
             ASTs & engine_args_ast = factory_args.engine_args;
@@ -768,7 +794,46 @@ void registerStorageFile(StorageFactory & factory)
             else
                 storage_args.compression_method = "auto";
 
-            if (0 <= source_fd) /// File descriptor
+            bool use_table_fd = 0 <= source_fd;
+
+            // Guess the table schema if it's required. In the future, we must pass a flag (smth like
+            // 'is_schema_provided') to determine whether the schema inference should be used.
+            if (factory_args.columns.empty())
+            {
+                std::unique_ptr<ReadBuffer> nested_buffer;
+                CompressionMethod method;
+
+                if (use_table_fd)
+                {
+                    nested_buffer = std::make_unique<ReadBufferFromFileDescriptor>(source_fd);
+                    method = chooseCompressionMethod("", storage_args.compression_method);
+                }
+                else
+                {
+                    auto paths = StorageFile::getPathsList(source_path, factory_args.getContext()->getUserFilesPath(), storage_args.getContext());
+                    String first_path = paths[0];
+                    nested_buffer = std::make_unique<ReadBufferFromFile>(first_path);
+                    method = chooseCompressionMethod(first_path, storage_args.compression_method);
+                }
+                // TODO: think how to use read buffer creation from StorageFile here.
+
+                auto read_buf = wrapReadBufferWithCompressionMethod(std::move(nested_buffer), method);
+                
+                FormatFactory & format_factory = FormatFactory::instance();
+                if (!format_factory.checkIfInputFormatSupportsFormatHeader(storage_args.format_name))
+                    throw Exception("InputFormat " + storage_args.format_name + " doesn't support schema inference", 
+                                    ErrorCodes::LOGICAL_ERROR);
+
+                auto format_header = format_factory.getInputFormatHeader(
+                    storage_args.format_name, *read_buf, storage_args.getContext(), 0, storage_args.format_settings);
+
+                format_header->readPrefix();
+                Block sample_block = format_header->getHeader();
+                storage_args.columns = ColumnsDescription(sample_block.getNamesAndTypesList());
+                storage_args.format_header.emplace(*format_header);
+            }
+
+            if (use_table_fd) /// File descriptor
                 return StorageFile::create(source_fd, storage_args);
             else /// User's file
                 return StorageFile::create(source_path, factory_args.getContext()->getUserFilesPath(), storage_args);

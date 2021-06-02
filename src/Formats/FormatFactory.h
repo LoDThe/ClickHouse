@@ -4,6 +4,7 @@
 #include <DataStreams/IBlockStream_fwd.h>
 #include <Formats/FormatSettings.h>
 #include <Interpreters/Context_fwd.h>
+#include <Processors/Formats/IInputFormatHeader.h>
 #include <IO/BufferWithOwnMemory.h>
 #include <common/types.h>
 
@@ -33,6 +34,7 @@ struct RowInputFormatParams;
 struct RowOutputFormatParams;
 
 using InputFormatPtr = std::shared_ptr<IInputFormat>;
+using InputFormatHeaderPtr = std::shared_ptr<IInputFormatHeader>;
 using OutputFormatPtr = std::shared_ptr<IOutputFormat>;
 
 FormatSettings getFormatSettings(ContextConstPtr context);
@@ -73,6 +75,11 @@ private:
         ReadCallback callback,
         const FormatSettings & settings)>;
 
+    using InputFormatHeaderCreator = std::function<InputFormatHeaderPtr(
+        ReadBuffer & buf,
+        const RowInputFormatParams & params,
+        const FormatSettings & settings)>;
+
     using OutputCreator = std::function<BlockOutputStreamPtr(
         WriteBuffer & buf,
         const Block & sample,
@@ -87,6 +94,12 @@ private:
 
     using InputProcessorCreator = std::function<InputProcessorCreatorFunc>;
 
+    using InputWithFormatHeaderProcessorCreator = std::function<InputFormatPtr(
+        ReadBuffer & buf,
+        IInputFormatHeader & format_header,
+        const RowInputFormatParams & params,
+        const FormatSettings & settings)>;
+
     using OutputProcessorCreator = std::function<OutputFormatPtr(
             WriteBuffer & buf,
             const Block & sample,
@@ -96,8 +109,10 @@ private:
     struct Creators
     {
         InputCreator input_creator;
+        InputFormatHeaderCreator input_format_header_creator;
         OutputCreator output_creator;
         InputProcessorCreator input_processor_creator;
+        InputWithFormatHeaderProcessorCreator input_with_format_header_processor_creator;
         OutputProcessorCreator output_processor_creator;
         FileSegmentationEngine file_segmentation_engine;
         bool supports_parallel_formatting{false};
@@ -113,6 +128,14 @@ public:
         const String & name,
         ReadBuffer & buf,
         const Block & sample,
+        ContextConstPtr context,
+        UInt64 max_block_size,
+        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+
+    InputFormatPtr getInput(
+        const String & name,
+        ReadBuffer & buf,
+        IInputFormatHeader & format_header,
         ContextConstPtr context,
         UInt64 max_block_size,
         const std::optional<FormatSettings> & format_settings = std::nullopt) const;
@@ -144,6 +167,21 @@ public:
         UInt64 max_block_size,
         const std::optional<FormatSettings> & format_settings = std::nullopt) const;
 
+    InputFormatPtr getInputFormat(
+        const String & name,
+        ReadBuffer & buf,
+        IInputFormatHeader & format_header,
+        ContextConstPtr context,
+        UInt64 max_block_size,
+        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+
+    InputFormatHeaderPtr getInputFormatHeader(
+        const String & name,
+        ReadBuffer & buf,
+        ContextConstPtr context,
+        UInt64 max_block_size,
+        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+
     /// Checks all preconditions. Returns ordinary format if parallel formatting cannot be done.
     OutputFormatPtr getOutputFormatParallelIfPossible(
         const String & name,
@@ -161,12 +199,16 @@ public:
         WriteCallback callback = {},
         const std::optional<FormatSettings> & format_settings = std::nullopt) const;
 
+    bool checkIfInputFormatSupportsFormatHeader(const String & name);
+
     /// Register format by its name.
     void registerInputFormat(const String & name, InputCreator input_creator);
+    void registerInputFormatHeader(const String & name, InputFormatHeaderCreator format_header_creator);
     void registerOutputFormat(const String & name, OutputCreator output_creator);
     void registerFileSegmentationEngine(const String & name, FileSegmentationEngine file_segmentation_engine);
 
     void registerInputFormatProcessor(const String & name, InputProcessorCreator input_creator);
+    void registerInputFormatWithFormatHeaderProcessor(const String & name, InputWithFormatHeaderProcessorCreator input_creator);
     void registerOutputFormatProcessor(const String & name, OutputProcessorCreator output_creator);
 
     void markOutputFormatSupportsParallelFormatting(const String & name);
@@ -183,6 +225,11 @@ private:
     FormatsDictionary dict;
 
     const Creators & getCreators(const String & name) const;
+
+    RowInputFormatParams getRowInputFormatParams(
+        UInt64 max_block_size, 
+        const FormatSettings & format_settings, 
+        const Settings & settings) const; 
 };
 
 }

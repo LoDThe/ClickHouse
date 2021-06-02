@@ -1,10 +1,13 @@
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromString.h>
 
+#include <Common/assert_cast.h>
 #include <Processors/Formats/Impl/JSONCompactEachRowRowInputFormat.h>
 #include <Formats/FormatFactory.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/Serializations/SerializationNullable.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeNullable.h>
 
 namespace DB
 {
@@ -15,8 +18,74 @@ namespace ErrorCodes
     extern const int CANNOT_READ_ALL_DATA;
 }
 
+inline void skipEndOfLine(ReadBuffer & in);
 
-JSONCompactEachRowRowInputFormat::JSONCompactEachRowRowInputFormat(ReadBuffer & in_,
+JSONCompactEachRowRowInputFormatHeader::JSONCompactEachRowRowInputFormatHeader(ReadBuffer & in_)
+    : IInputFormatHeader(in_)
+{
+}
+
+void JSONCompactEachRowRowInputFormatHeader::readPrefix()
+{
+    std::vector<String> column_names;
+    DataTypes column_data_types;
+
+    /// In this format, BOM at beginning of stream cannot be confused with value, so it is safe to skip it.
+    skipBOMIfExists(in);
+
+    /// Read column names from buffer.
+    assertChar('[', in);
+    do
+    {
+        skipWhitespaceIfAny(in);
+        String column_name;
+        readJSONString(column_name, in);
+        column_names.emplace_back(column_name);
+        skipWhitespaceIfAny(in);
+    }
+    while (checkChar(',', in));
+    assertChar(']', in);
+    skipEndOfLine(in);
+
+    const DataTypeFactory & data_type_factory = DataTypeFactory::instance();
+
+    /// Read column types from buffer.
+    assertChar('[', in);
+    do
+    {
+        skipWhitespaceIfAny(in);
+        String data_type_name;
+        readJSONString(data_type_name, in);
+
+        DataTypePtr data_type = data_type_factory.get(data_type_name);
+        column_data_types.emplace_back(data_type);
+
+        skipWhitespaceIfAny(in);
+    }
+    while (checkChar(',', in));
+    assertChar(']', in);
+
+    if (column_names.size() != column_data_types.size()) {
+        throw Exception(
+            "JSONCompactEachRow header reader found mismatch of the number of column names and data types: \
+            got " + std::to_string(column_names.size()) + " column names " + 
+            "and " + std::to_string(column_data_types.size()) + " data types",
+            ErrorCodes::INCORRECT_DATA
+        );
+    }
+
+    header = std::make_shared<Block>();
+
+    for (size_t i = 0; i < column_names.size(); ++i)
+    {
+        ColumnWithTypeAndName column(column_data_types[i], column_names[i]);
+        header->insert(column);
+    }
+}
+
+
+JSONCompactEachRowRowInputFormat::JSONCompactEachRowRowInputFormat(
+    ReadBuffer & in_,
         const Block & header_,
         Params params_,
         const FormatSettings & format_settings_,
@@ -39,6 +108,19 @@ JSONCompactEachRowRowInputFormat::JSONCompactEachRowRowInputFormat(ReadBuffer & 
     }
 }
 
+JSONCompactEachRowRowInputFormat::JSONCompactEachRowRowInputFormat(
+        ReadBuffer & in_,
+        IInputFormatHeader & format_header_,
+        Params params_,
+        const FormatSettings & format_settings_,
+        bool with_names_,
+        bool yield_strings_)
+        : JSONCompactEachRowRowInputFormat(in_, format_header_.getHeader(), std::move(params_), 
+                                           format_settings_, with_names_, yield_strings_)
+{
+    format_header.emplace(assert_cast<JSONCompactEachRowRowInputFormatHeader &>(format_header_));
+}
+
 void JSONCompactEachRowRowInputFormat::resetParser()
 {
     IRowInputFormat::resetParser();
@@ -48,51 +130,43 @@ void JSONCompactEachRowRowInputFormat::resetParser()
 
 void JSONCompactEachRowRowInputFormat::readPrefix()
 {
-    /// In this format, BOM at beginning of stream cannot be confused with value, so it is safe to skip it.
     skipBOMIfExists(in);
 
     if (with_names)
     {
+        Block header;
+        if (format_header) 
+        {
+            header = getPort().getHeader();
+        }
+        else 
+        {
+            format_header.emplace(in);
+            format_header->readPrefix();
+            header = format_header->getHeader();
+        }
+        DataTypes read_data_types = header.getDataTypes();
+
         size_t num_columns = getPort().getHeader().columns();
         read_columns.assign(num_columns, false);
 
-        assertChar('[', in);
-        do
-        {
-            skipWhitespaceIfAny(in);
-            String column_name;
-            readJSONString(column_name, in);
-            addInputColumn(column_name);
-            skipWhitespaceIfAny(in);
-        }
-        while (checkChar(',', in));
-        assertChar(']', in);
-        skipEndOfLine();
+        for (const String & name : header.getNames())
+            addInputColumn(name);
 
         /// Type checking
-        assertChar('[', in);
         for (size_t i = 0; i < column_indexes_for_input_fields.size(); ++i)
         {
-            skipWhitespaceIfAny(in);
-            String data_type;
-            readJSONString(data_type, in);
-
             if (column_indexes_for_input_fields[i] &&
-                data_types[*column_indexes_for_input_fields[i]]->getName() != data_type)
+                data_types[*column_indexes_for_input_fields[i]]->getName() != read_data_types[i]->getName())
             {
                 throw Exception(
                         "Type of '" + getPort().getHeader().getByPosition(*column_indexes_for_input_fields[i]).name
                         + "' must be " + data_types[*column_indexes_for_input_fields[i]]->getName() +
-                        ", not " + data_type,
+                        ", not " + read_data_types[i]->getName(),
                         ErrorCodes::INCORRECT_DATA
                 );
             }
-
-            if (i != column_indexes_for_input_fields.size() - 1)
-                assertChar(',', in);
-            skipWhitespaceIfAny(in);
         }
-        assertChar(']', in);
     }
     else
     {
@@ -147,7 +221,7 @@ void JSONCompactEachRowRowInputFormat::addInputColumn(const String & column_name
 
 bool JSONCompactEachRowRowInputFormat::readRow(DB::MutableColumns &columns, DB::RowReadExtension &ext)
 {
-    skipEndOfLine();
+    skipEndOfLine(in);
 
     if (in.eof())
         return false;
@@ -187,7 +261,7 @@ bool JSONCompactEachRowRowInputFormat::readRow(DB::MutableColumns &columns, DB::
     return true;
 }
 
-void JSONCompactEachRowRowInputFormat::skipEndOfLine()
+inline void skipEndOfLine(ReadBuffer & in)
 {
     skipWhitespaceIfAny(in);
     if (!in.eof() && (*in.position() == ',' || *in.position() == ';'))
@@ -255,6 +329,14 @@ void registerInputFormatProcessorJSONCompactEachRow(FormatFactory & factory)
     {
         return std::make_shared<JSONCompactEachRowRowInputFormat>(buf, sample, std::move(params), settings, true, false);
     });
+    factory.registerInputFormatWithFormatHeaderProcessor("JSONCompactEachRowWithNamesAndTypes", [](
+            ReadBuffer & buf,
+            IInputFormatHeader & format_header,
+            IRowInputFormat::Params params,
+            const FormatSettings & settings)
+    {
+        return std::make_shared<JSONCompactEachRowRowInputFormat>(buf, format_header, std::move(params), settings, true, false);
+    });
 
     factory.registerInputFormatProcessor("JSONCompactStringsEachRow", [](
             ReadBuffer & buf,
@@ -273,6 +355,27 @@ void registerInputFormatProcessorJSONCompactEachRow(FormatFactory & factory)
     {
         return std::make_shared<JSONCompactEachRowRowInputFormat>(buf, sample, std::move(params), settings, true, true);
     });
+    factory.registerInputFormatWithFormatHeaderProcessor("JSONCompactStringsEachRowWithNamesAndTypes", [](
+            ReadBuffer & buf,
+            IInputFormatHeader & format_header,
+            IRowInputFormat::Params params,
+            const FormatSettings & settings)
+    {
+        return std::make_shared<JSONCompactEachRowRowInputFormat>(buf, format_header, std::move(params), settings, true, true);
+    });
+
+    for (const auto & type : {"JSONCompactEachRowWithNamesAndTypes", "JSONCompactStringsEachRowWithNamesAndTypes"})
+    {
+        factory.registerInputFormatHeader(type, [](
+                ReadBuffer & buf,
+                IRowInputFormat::Params params,
+                const FormatSettings & settings)
+        {
+            (void)params;
+            (void)settings;
+            return std::make_shared<JSONCompactEachRowRowInputFormatHeader>(buf);
+        });
+    }
 }
 
 }
